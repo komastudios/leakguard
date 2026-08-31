@@ -6,7 +6,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/leakguard.svg)](https://crates.io/crates/leakguard)
 [![Docs.rs](https://docs.rs/leakguard/badge.svg)](https://docs.rs/leakguard)
-[![CI](https://github.com/ptukovar/leakguard/actions/workflows/ci.yml/badge.svg)](https://github.com/ptukovar/leakguard/actions)
+[![CI](https://github.com/komastudios/leakguard/actions/workflows/ci.yml/badge.svg)](https://github.com/komastudios/leakguard/actions)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
 [![No deps](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](#why-leakguard)
 ![Crates.io Total Downloads](https://img.shields.io/crates/d/leakguard)
