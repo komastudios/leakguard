@@ -6,7 +6,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/leakguard.svg)](https://crates.io/crates/leakguard)
 [![Docs.rs](https://docs.rs/leakguard/badge.svg)](https://docs.rs/leakguard)
-[![CI](https://github.com/ptukovar/leakguard/actions/workflows/ci.yml/badge.svg)](https://github.com/ptukovar/leakguard/actions)
+[![CI](https://github.com/komastudios/leakguard/actions/workflows/ci.yml/badge.svg)](https://github.com/komastudios/leakguard/actions)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
 [![No deps](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](#why-leakguard)
 ![Crates.io Total Downloads](https://img.shields.io/crates/d/leakguard)
@@ -53,6 +53,26 @@ leakguard = "0.8.1"
 ```sh
 # CLI
 cargo install leakguard
+```
+
+### Prebuilt binaries
+
+Every release ships standalone binaries for Linux, macOS and Windows on both x86-64
+and arm64. They need no Rust toolchain, and the Linux builds are statically linked
+against musl, so they run on any distribution including Alpine and distroless images.
+
+```sh
+# Pick the asset matching your platform from the latest release
+curl -LO https://github.com/komastudios/leakguard/releases/latest/download/leakguard-v0.8.1-x86_64-unknown-linux-musl
+chmod +x leakguard-v0.8.1-x86_64-unknown-linux-musl
+./leakguard-v0.8.1-x86_64-unknown-linux-musl --version
+```
+
+Each release also carries a `SHA256SUMS` file to verify the download:
+
+```sh
+curl -LO https://github.com/komastudios/leakguard/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
 ```
 
 ## Library usage
