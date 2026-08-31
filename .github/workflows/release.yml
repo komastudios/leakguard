@@ -1,0 +1,369 @@
+# Standalone binary releases.
+#
+#   prepare ─ build (6 targets) ─ package ─ publish
+#
+# prepare: resolve the version, tag and commit, then refuse to go further if the
+#          version disagrees with Cargo.toml or the tag points at another commit.
+#          Runs before the six builds so a bad version costs seconds, not minutes.
+# build:   one raw binary per target. Legs whose host can execute what they built
+#          smoke test it; the two cross legs cannot and say so in the matrix.
+# package: collect the binaries, checksum them and render the release notes. Runs
+#          on every trigger, so a dry run exercises everything except the upload.
+# publish: a single `gh release create`. No checkout, no cargo, no third-party
+#          action — it is the only job holding contents: write.
+#
+# Releases are cut for an explicitly chosen commit: either a pushed v*.*.* tag, or
+# a manual dispatch naming a ref and version. Nothing is published automatically.
+name: release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version, e.g. 0.9.0 (empty = read from Cargo.toml)
+        type: string
+        default: ''
+      ref:
+        description: Commit SHA or branch to build (empty = the ref selected above)
+        type: string
+        default: ''
+      dry_run:
+        description: Build and package the assets but do not publish a release
+        type: boolean
+        default: true
+
+# contents stays read for the whole workflow; only the job that cuts the release
+# gets write, so a compromised build stage cannot push to the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.version || github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # The [profile.release] strip knob as an environment variable, so release
+  # binaries ship without symbols and the published crate's profile stays empty.
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+
+jobs:
+  prepare:
+    name: resolve version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      publish: ${{ steps.resolve.outputs.publish }}
+      tag_exists: ${{ steps.resolve.outputs.tag_exists }}
+      release_exists: ${{ steps.probe.outputs.release_exists }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # On a tag push `inputs` is null, so this falls through to github.ref.
+          ref: ${{ inputs.ref || github.ref }}
+          # Needed to resolve an existing tag, and to accept a bare SHA input.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - id: resolve
+        env:
+          IN_VERSION: ${{ inputs.version }}
+          IN_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          CARGO_VERSION="$(awk -F'"' '
+            /^\[/ { in_pkg = ($0 == "[package]") }
+            in_pkg && /^version[[:space:]]*=/ { print $2; exit }
+          ' Cargo.toml)"
+          [ -n "$CARGO_VERSION" ] || {
+            echo "::error::could not parse the [package] version from Cargo.toml"; exit 1; }
+
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            TAG="$GITHUB_REF_NAME"; VERSION="${TAG#v}"; SOURCE="tag $TAG"
+          else
+            VERSION="${IN_VERSION:-$CARGO_VERSION}"; TAG="v$VERSION"; SOURCE="dispatch input"
+          fi
+
+          # The binary prints env!("CARGO_PKG_VERSION"), so it can only ever report
+          # the Cargo.toml value; a release naming anything else would contradict it.
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::$SOURCE says $VERSION but Cargo.toml says $CARGO_VERSION"
+            exit 1
+          fi
+          case "$VERSION" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::version '$VERSION' is not X.Y.Z"; exit 1 ;;
+          esac
+
+          # Test the event first: on a tag push IN_DRY_RUN is empty, never 'false'.
+          if   [ "$GITHUB_EVENT_NAME" = "push" ]; then PUBLISH=true
+          elif [ "${IN_DRY_RUN:-}" = "false" ];   then PUBLISH=true
+          else                                         PUBLISH=false
+          fi
+
+          SHA="$(git rev-parse HEAD)"
+
+          # `gh release create --target` is silently ignored when the tag already
+          # exists, so a tag pointing elsewhere would attach these binaries to a
+          # different commit without any error. Refuse instead.
+          if git rev-parse -q --verify "refs/tags/$TAG^{commit}" >/dev/null; then
+            TAG_EXISTS=true
+            TAG_SHA="$(git rev-parse "refs/tags/$TAG^{commit}")"
+            if [ "$TAG_SHA" != "$SHA" ]; then
+              echo "::error::tag $TAG is at $TAG_SHA but this run builds $SHA"
+              exit 1
+            fi
+          else
+            TAG_EXISTS=false
+          fi
+
+          { echo "version=$VERSION"; echo "tag=$TAG"; echo "sha=$SHA"
+            echo "publish=$PUBLISH"; echo "tag_exists=$TAG_EXISTS"
+          } | tee -a "$GITHUB_OUTPUT"
+
+      - id: probe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # This repository is a fork, and gh resolves a fork's default repo to its
+          # parent; without this it would read the parent's releases and try to
+          # publish there. Set on every step that shells out to gh.
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          PUBLISH: ${{ steps.resolve.outputs.publish }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then EXISTS=true; else EXISTS=false; fi
+          echo "release_exists=$EXISTS" | tee -a "$GITHUB_OUTPUT"
+          if [ "$EXISTS" = "true" ] && [ "$PUBLISH" = "true" ]; then
+            echo "::error::release $TAG already exists; delete it or re-run with dry_run=true"
+            exit 1
+          fi
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+          PUBLISH: ${{ steps.resolve.outputs.publish }}
+          TAG_EXISTS: ${{ steps.resolve.outputs.tag_exists }}
+        run: |
+          {
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| version | \`$VERSION\` |"
+            echo "| tag | \`$TAG\` (exists: $TAG_EXISTS) |"
+            echo "| commit | \`$SHA\` |"
+            echo "| publish | $PUBLISH |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: ${{ matrix.target }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `smoke` is a property of the runner/target pairing, not of the target
+          # name: a leg can only run what it built when the host matches.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            smoke: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            smoke: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            smoke: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            smoke: false # the arm64 macOS image carries no Rosetta
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            smoke: true
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            smoke: false # x64 host
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Always the resolved commit, never a branch that could move mid-run.
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          case "$TARGET" in *-windows-*) EXT=.exe ;; *) EXT= ;; esac
+          # Default features already satisfy the bin's required-features = ["std"];
+          # `parallel` changes nothing in the CLI today.
+          cargo build --release --locked --target "$TARGET" --bin leakguard
+          mkdir -p dist
+          cp "target/$TARGET/release/leakguard$EXT" "dist/leakguard-v$VERSION-$TARGET$EXT"
+          ls -l dist
+
+      - name: Smoke test
+        if: matrix.smoke
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          case "$TARGET" in *-windows-*) EXT=.exe ;; *) EXT= ;; esac
+          bin="./dist/leakguard-v$VERSION-$TARGET$EXT"
+          # Rust's println! does no CRLF translation, so this is exact on Windows too.
+          out="$("$bin" --version)"
+          if [ "$out" != "leakguard $VERSION" ]; then
+            echo "::error::expected 'leakguard $VERSION', got '$out'"; exit 1
+          fi
+          "$bin" --list-kinds >/dev/null
+          echo "$out"
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@v4
+        with:
+          # Unique per leg: upload-artifact@v4 rejects a repeated name outright.
+          name: leakguard-${{ matrix.target }}
+          path: dist/leakguard-*
+          if-no-files-found: error
+          retention-days: 7
+
+  package:
+    name: package and checksum
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: leakguard-*
+          # Without this, v4 nests each artifact under dist/<artifact-name>/.
+          merge-multiple: true
+          path: dist
+
+      - name: Check the asset set
+        run: |
+          set -euo pipefail
+          n="$(find dist -maxdepth 1 -type f | wc -l)"
+          if [ "$n" -ne 6 ]; then
+            echo "::error::expected 6 binaries, found $n"; ls -l dist; exit 1
+          fi
+          ls -l dist
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          # Hashed from inside dist so the manifest lists bare filenames, and
+          # written outside it first so it cannot hash itself.
+          ( cd dist && find . -maxdepth 1 -type f -printf '%f\n' \
+              | LC_ALL=C sort | xargs sha256sum ) > SHA256SUMS
+          mv SHA256SUMS dist/
+          cat dist/SHA256SUMS
+
+      - name: Release notes
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # Literal prefix match, so the dots in the version need no escaping.
+          awk -v hdr="## [$VERSION]" '
+            index($0, hdr) == 1 { f = 1; next }
+            f && /^## /         { exit }
+            f && NF             { p = 1 }
+            f && p              { print }
+          ' CHANGELOG.md > section.md
+          [ -s section.md ] || printf 'Release %s.\n\nSee CHANGELOG.md for details.\n' \
+            "$TAG" > section.md
+          {
+            cat section.md
+            echo
+            echo '## Downloads'
+            echo
+            echo 'Standalone binaries, no runtime needed. The Linux builds are statically'
+            echo 'linked against musl and run on any distribution.'
+            echo
+            echo 'On Linux and macOS, mark the download executable after fetching it:'
+            echo
+            echo '```sh'
+            echo "curl -LO $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$TAG/leakguard-$TAG-x86_64-unknown-linux-musl"
+            echo "chmod +x leakguard-$TAG-x86_64-unknown-linux-musl"
+            echo '```'
+            echo
+            echo '### SHA256'
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+            echo
+            echo "Built from \`$SHA\` by [run $GITHUB_RUN_ID]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)."
+          } > dist/notes.md
+          cat dist/notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish release
+    needs: [prepare, package]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+          TAG_EXISTS: ${{ needs.prepare.outputs.tag_exists }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists; not republishing" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          args=( "$TAG" --title "$TAG" --notes-file dist/notes.md )
+          if [ "$TAG_EXISTS" = "true" ]; then
+            # Tag-push path: the tag is already there and --target would be ignored.
+            args+=( --verify-tag )
+          else
+            # Dispatch path: gh creates the tag at exactly the commit we built.
+            args+=( --target "$SHA" )
+          fi
+          # Explicit globs: a bare dist/* would upload notes.md as a seventh asset.
+          gh release create "${args[@]}" dist/leakguard-* dist/SHA256SUMS
+          echo "published $TAG" | tee -a "$GITHUB_STEP_SUMMARY"

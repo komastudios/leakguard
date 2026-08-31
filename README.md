@@ -55,6 +55,26 @@ leakguard = "0.8.1"
 cargo install leakguard
 ```
 
+### Prebuilt binaries
+
+Every release ships standalone binaries for Linux, macOS and Windows on both x86-64
+and arm64. They need no Rust toolchain, and the Linux builds are statically linked
+against musl, so they run on any distribution including Alpine and distroless images.
+
+```sh
+# Pick the asset matching your platform from the latest release
+curl -LO https://github.com/komastudios/leakguard/releases/latest/download/leakguard-v0.8.1-x86_64-unknown-linux-musl
+chmod +x leakguard-v0.8.1-x86_64-unknown-linux-musl
+./leakguard-v0.8.1-x86_64-unknown-linux-musl --version
+```
+
+Each release also carries a `SHA256SUMS` file to verify the download:
+
+```sh
+curl -LO https://github.com/komastudios/leakguard/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
 ## Library usage
 
 ### Pick a masking strategy
